@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>XAMusic 控制台</title>
+    <!-- 引入 Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 引入图标库 -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+</head>
+<body class="bg-slate-100 min-h-screen p-6">
+
+    <div class="max-w-6xl mx-auto space-y-6">
+
+        <!-- 顶部状态栏 -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <!-- 引擎状态 -->
+            <div class="bg-white p-4 rounded-lg shadow-sm border border-slate-200 flex items-center justify-between">
+                <div>
+                    <p class="text-sm text-slate-500">引擎状态</p>
+                    <p id="status-text" class="text-xl font-bold text-slate-700">Checking...</p>
+                </div>
+                <div id="status-icon" class="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center text-slate-400">
+                    <i class="fas fa-heartbeat"></i>
+                </div>
+            </div>
+
+            <!-- 心跳时间 -->
+            <div class="bg-white p-4 rounded-lg shadow-sm border border-slate-200 flex items-center justify-between">
+                <div>
+                    <p class="text-sm text-slate-500">最后心跳</p>
+                    <p id="last-heartbeat" class="text-xl font-bold text-slate-700">--:--:--</p>
+                </div>
+                <div class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-blue-500">
+                    <i class="fas fa-clock"></i>
+                </div>
+            </div>
+
+            <!-- 成功播放次数 (已修改) -->
+            <div class="bg-white p-4 rounded-lg shadow-sm border border-slate-200 flex items-center justify-between">
+                <div>
+                    <p class="text-sm text-slate-500">成功播放次数</p>
+                    <!-- ID已修改为 success-count -->
+                    <p id="success-count" class="text-xl font-bold text-slate-700">0</p>
+                </div>
+                <div class="w-10 h-10 rounded-full bg-green-50 flex items-center justify-center text-green-500">
+                    <!-- 图标改为了对勾 -->
+                    <i class="fas fa-check-circle"></i>
+                </div>
+            </div>
+        </div>
+
+        <!-- 主功能区 -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+            <!-- 左侧：手动控制 -->
+            <div class="lg:col-span-1 space-y-6">
+                <div class="bg-white p-6 rounded-lg shadow-sm border border-slate-200">
+                    <h2 class="text-lg font-semibold text-slate-800 mb-4"><i class="fas fa-play-circle mr-2"></i>手动点歌</h2>
+                    <div class="space-y-4">
+                        <input type="text" id="song-input" placeholder="输入歌名 (例如: 稻香)"
+                               class="w-full px-4 py-2 border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        <button onclick="manualPlay()" id="play-btn"
+                                class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-md transition duration-200 flex justify-center items-center">
+                            <span>立即播放</span>
+                        </button>
+                    </div>
+                    <div id="manual-result" class="mt-4 text-sm text-slate-600 hidden p-3 bg-slate-50 rounded"></div>
+                </div>
+
+                <div class="bg-white p-6 rounded-lg shadow-sm border border-slate-200">
+                    <h2 class="text-lg font-semibold text-slate-800 mb-4"><i class="fas fa-trash-alt mr-2"></i>数据管理</h2>
+                    <button onclick="clearLogs()" class="w-full border border-red-300 text-red-600 hover:bg-red-50 font-medium py-2 px-4 rounded-md transition duration-200">
+                        清空所有日志
+                    </button>
+                </div>
+            </div>
+
+            <!-- 右侧：实时日志 -->
+            <div class="lg:col-span-2">
+                <div class="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden h-[600px] flex flex-col">
+                    <div class="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
+                        <h2 class="font-semibold text-slate-800"><i class="fas fa-list-alt mr-2"></i>系统运行日志</h2>
+                        <span class="text-xs text-slate-400">每2秒自动刷新</span>
+                    </div>
+                    <div class="flex-1 overflow-y-auto p-4" id="log-container">
+                        <!-- 日志将通过 JS 插入这里 -->
+                        <div class="text-center text-slate-400 py-10">正在加载日志...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- JavaScript 逻辑 -->
+    <script>
+        // === 1. 更新状态栏 ===
+        async function updateStats() {
+            try {
+                const res = await fetch('/api/stats');
+                const data = await res.json();
+
+                // 引擎状态
+                const statusText = document.getElementById('status-text');
+                const statusIcon = document.getElementById('status-icon');
+
+                if (data.thread_active) {
+                    statusText.innerText = "运行中"; // 中文状态
+                    statusText.className = "text-xl font-bold text-green-600";
+                    statusIcon.className = "w-10 h-10 rounded-full bg-green-100 flex items-center justify-center text-green-600 animate-pulse";
+                } else {
+                    statusText.innerText = "离线"; // 中文状态
+                    statusText.className = "text-xl font-bold text-red-600";
+                    statusIcon.className = "w-10 h-10 rounded-full bg-red-100 flex items-center justify-center text-red-600";
+                }
+
+                // 其他数据
+                document.getElementById('last-heartbeat').innerText = data.last_heartbeat || "--:--:--";
+
+                // === 修改点：显示成功次数，单位为“次” ===
+                document.getElementById('success-count').innerText = (data.success_count || 0) + " 次";
+
+            } catch (e) {
+                console.error("Stats fetch error:", e);
+            }
+        }
+
+        // === 2. 获取日志 ===
+        async function updateLogs() {
+            try {
+                const res = await fetch('/api/logs');
+                const logs = await res.json();
+
+                const container = document.getElementById('log-container');
+                if (logs.length === 0) {
+                    container.innerHTML = '<div class="text-center text-slate-400 py-10">暂无日志记录</div>';
+                    return;
+                }
+
+                let html = '';
+                logs.forEach(log => {
+                    // === 修改点：适配中文状态 ===
+                    let colorClass = "text-slate-600";
+                    let bgClass = "bg-slate-50";
+
+                    // 成功类关键词
+                    if (log.status === '成功' || log.status === '发现指令') {
+                        colorClass = "text-green-700";
+                        bgClass = "bg-green-50 border-green-100";
+                    }
+                    // 失败类关键词
+                    else if (log.status === '失败' || log.status === '报错' || log.status === '无结果') {
+                        colorClass = "text-red-700";
+                        bgClass = "bg-red-50 border-red-100";
+                    }
+
+                    html += `
+                        <div class="mb-3 p-3 rounded border ${bgClass} text-sm">
+                            <div class="flex justify-between items-start mb-1">
+                                <span class="font-mono text-xs text-slate-400">${log.time}</span>
+                                <span class="font-bold text-xs px-2 py-0.5 rounded bg-white/50 ${colorClass}">${log.status}</span>
+                            </div>
+                            <div class="flex items-center gap-2 mb-1">
+                                <span class="font-semibold text-slate-700">[${log.type}]</span>
+                                <span class="text-slate-800">${log.detail}</span>
+                            </div>
+                            ${log.response ? `<div class="mt-2 text-xs font-mono text-slate-500 bg-white/50 p-2 rounded truncate">${log.response}</div>` : ''}
+                            <div class="mt-1 text-right text-xs text-slate-300">${log.duration}ms</div>
+                        </div>
+                    `;
+                });
+                container.innerHTML = html;
+            } catch (e) {
+                console.error("Logs fetch error:", e);
+            }
+        }
+
+        // === 3. 手动点歌 ===
+        async function manualPlay() {
+            const input = document.getElementById('song-input');
+            const btn = document.getElementById('play-btn');
+            const resultDiv = document.getElementById('manual-result');
+            const songName = input.value.trim();
+
+            if (!songName) {
+                alert("请输入歌名");
+                return;
+            }
+
+            // UI Loading 状态
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+            btn.disabled = true;
+            resultDiv.classList.add('hidden');
+
+            try {
+                const res = await fetch('/api/manual_exec', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ song_name: songName })
+                });
+                const data = await res.json();
+
+                resultDiv.classList.remove('hidden');
+                if (data.success) {
+                    resultDiv.className = "mt-4 text-sm p-3 bg-green-50 text-green-700 rounded border border-green-200";
+                    resultDiv.innerText = "✅ " + data.msg;
+                    input.value = ""; // 清空输入框
+                    updateLogs(); // 立即刷新日志
+                } else {
+                    resultDiv.className = "mt-4 text-sm p-3 bg-red-50 text-red-700 rounded border border-red-200";
+                    resultDiv.innerText = "❌ " + data.msg;
+                }
+            } catch (e) {
+                alert("请求失败: " + e);
+            } finally {
+                btn.innerHTML = '<span>立即播放</span>';
+                btn.disabled = false;
+            }
+        }
+
+        // === 4. 清空日志 ===
+        async function clearLogs() {
+            if(!confirm("确定要清空所有历史记录吗？")) return;
+            await fetch('/api/clear_logs', { method: 'POST' });
+            updateLogs();
+        }
+
+        // === 5. 定时器 ===
+        // 页面加载时立即执行一次
+        updateStats();
+        updateLogs();
+
+        // 每2秒刷新一次
+        setInterval(() => {
+            updateStats();
+            updateLogs();
+        }, 2000);
+    </script>
+</body>
+</html>
