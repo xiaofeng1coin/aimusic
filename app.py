@@ -13,7 +13,6 @@ from mutagen import File
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
 
-# ... (日志配置不变) ...
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 log.propagate = False
@@ -21,7 +20,7 @@ log.propagate = False
 import database
 from music_apis import search_and_get_url
 
-# ... (配置区域不变) ...
+# ... (配置区域) ...
 HA_URL = os.getenv("HA_URL", "http://192.168.1.X:8123")
 HA_TOKEN = os.getenv("HA_TOKEN", "")
 PLAYER_ENTITY_ID = os.getenv("PLAYER_ENTITY_ID", "")
@@ -30,68 +29,56 @@ MUSIC_SOURCE = os.getenv("MUSIC_SOURCE", "all")
 
 app = Flask(__name__)
 
-# === 系统状态 (新增播放相关状态) ===
+# === 系统状态 ===
 system_status = {
     "thread_active": False,
     "last_heartbeat": None,
     "total_calls": 0,
-    
     # 歌单播放状态
     "playlist_mode": False,
     "current_playlist_name": "",
-    "queue": [], # [{name, url}, ...]
+    "queue": [], 
     "current_index": -1,
     "playing_start_time": 0,
-    "current_duration": 0
+    "current_duration": 0,
+    
+    # 本地记录当前播放信息，用于前端显示
+    "current_track_title": "等待播放", 
+    "current_track_source": ""
 }
 
-# === 辅助函数：获取网络音频时长 (需求5) ===
+# === 辅助功能 ===
 def get_audio_duration(url):
-    """
-    通过下载文件头获取时长，支持 mp3, m4a 等
-    """
+    """获取网络音频时长"""
     try:
-        print(f"⏳ 正在计算时长: {url[:30]}...")
         headers = {"User-Agent": "Mozilla/5.0"}
-        # 尝试流式下载前 128KB 数据用于分析头部
         resp = requests.get(url, headers=headers, stream=True, timeout=5)
-        
-        # 读取一部分数据到内存
         data = io.BytesIO()
         for chunk in resp.iter_content(chunk_size=4096):
             data.write(chunk)
-            if data.tell() > 128 * 1024: # 读取 128KB
-                break
+            if data.tell() > 128 * 1024: break
         data.seek(0)
         
-        # 尝试解析
         audio = None
-        try:
-            audio = MP3(data)
+        try: audio = MP3(data)
         except:
-            try:
+            try: 
                 data.seek(0)
                 audio = MP4(data)
-            except:
-                try:
-                    data.seek(0)
-                    audio = File(data)
-                except:
-                    pass
+            except: pass
         
         if audio and audio.info and audio.info.length:
-            duration = int(audio.info.length)
-            print(f"✅ 获取时长成功: {duration}秒")
-            return duration
-    except Exception as e:
-        print(f"⚠️ 获取时长失败: {e}")
-    
-    return 0 # 失败返回0
+            return int(audio.info.length)
+    except:
+        pass
+    return 0
 
-# ... (record_action, call_ha_service, get_ha_state 保持不变) ...
 def record_action(action_type, detail, status, api_response="", duration=0):
     system_status["total_calls"] += 1
-    database.insert_log(action_type, detail, status, str(api_response)[:500], duration)
+    try:
+        database.insert_log(action_type, detail, status, str(api_response)[:500], duration)
+    except:
+        pass
 
 def call_ha_service(domain, service, service_data):
     url = f"{HA_URL}/api/services/{domain}/{service}"
@@ -102,7 +89,26 @@ def call_ha_service(domain, service, service_data):
     except:
         return False
 
+def get_ha_player_info():
+    """获取播放器的状态"""
+    if not PLAYER_ENTITY_ID:
+        return "unknown", {}
+        
+    url = f"{HA_URL}/api/states/{PLAYER_ENTITY_ID}"
+    headers = {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
+    try:
+        response = requests.get(url, headers=headers, timeout=2)
+        if response.status_code == 200:
+            data = response.json()
+            state = data.get('state', 'unknown')
+            attrs = data.get('attributes', {})
+            return state, attrs
+    except:
+        pass
+    return "unknown", {}
+
 def get_ha_state(entity_id):
+    """获取实体状态"""
     url = f"{HA_URL}/api/states/{entity_id}"
     headers = {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
     try:
@@ -113,85 +119,94 @@ def get_ha_state(entity_id):
         pass
     return None
 
-# === 核心：播放逻辑 ===
-
 def play_url_on_ha(url, song_name):
-    """单纯调用HA播放"""
-    success = call_ha_service("media_player", "play_media", {
+    return call_ha_service("media_player", "play_media", {
         "entity_id": PLAYER_ENTITY_ID,
         "media_content_id": url,
-        "media_content_type": "music"
+        "media_content_type": "music",
+        "extra": {
+            "title": song_name,
+            "thumb": "https://p1.music.126.net/tGHU62DTszbFQ37W9qPH5A==/109951165607028179.jpg"
+        }
     })
-    return success
 
+# === 歌单播放逻辑 ===
 def start_playlist_playback(playlist_name):
-    """(需求4) 启动歌单播放模式"""
     songs = database.get_playlist_songs(playlist_name)
     if not songs:
-        return False, "歌单为空或不存在"
+        return False, "歌单为空"
     
     system_status["playlist_mode"] = True
     system_status["current_playlist_name"] = playlist_name
     system_status["queue"] = songs
     system_status["current_index"] = 0
     
-    # 播放第一首
     play_current_queue_song()
     return True, f"开始播放歌单: {playlist_name}"
 
 def play_current_queue_song():
-    """播放队列中当前索引的歌曲 (需求6 - 计时开始)"""
     if not system_status["queue"]: return
     
+    # === 修改核心：循环逻辑 ===
+    # 如果当前索引超出了队列长度，说明刚播完最后一首，现在循环回第一首 (Index 0)
+    if system_status["current_index"] >= len(system_status["queue"]):
+        print("🔄 [循环模式] 歌单列表播放结束，重置至第一首")
+        system_status["current_index"] = 0
+
     idx = system_status["current_index"]
-    if idx >= len(system_status["queue"]):
-        system_status["playlist_mode"] = False # 播放结束
-        print("🏁 歌单播放结束")
+    
+    song_data = system_status["queue"][idx]
+    song_name = song_data['name']
+    print(f"\n====== [歌单播放] 第 {idx+1} 首: {song_name} ======")
+
+    success, msg, song_info, play_url, error_logs = search_and_get_url(song_name, source="all")
+    
+    if not success:
+        print(f"❌ [歌单] 搜索失败，跳过")
+        record_action("歌单跳过", song_name, "失败", msg, 0)
+        system_status["current_index"] += 1
+        play_current_queue_song() # 递归调用，会自动处理循环
         return
 
-    song = system_status["queue"][idx]
-    print(f"▶️ [歌单] 播放第 {idx+1} 首: {song['name']}")
-    
-    # 1. 获取时长 (需求5)
-    duration = get_audio_duration(song['url'])
-    # 如果获取失败，默认给一个 3分30秒，或者不自动切歌(视策略而定)，这里给默认值防止死循环
+    duration = get_audio_duration(play_url)
     if duration == 0: duration = 210 
+    
+    real_source = song_info.get('source_label', 'unknown')
+    
+    # === 日志打印区域 ===
+    print(f"🎉 [歌单选中] 源: {real_source}")
+    print(f"🔗 [播放地址] {play_url}")
     
     system_status["current_duration"] = duration
     
-    # 2. 调用 HA
-    if play_url_on_ha(song['url'], song['name']):
-        # 3. 开始计时
+    if play_url_on_ha(play_url, song_info['name']):
         system_status["playing_start_time"] = time.time()
-        record_action("歌单播放", f"{song['name']} (歌单:{system_status['current_playlist_name']})", "成功", song['url'], 0)
+        
+        # 更新本地状态
+        system_status["current_track_title"] = song_info['name']
+        system_status["current_track_source"] = real_source
+        
+        record_action("歌单播放", f"{song_info['name']} (源:{real_source})", "成功", play_url, 0)
     else:
-        record_action("歌单播放", f"{song['name']}", "HA调用失败", "", 0)
-        # 失败则跳下一首
+        # 播放失败，尝试下一首
         system_status["current_index"] += 1
         play_current_queue_song()
 
+# === 核心搜索逻辑 ===
 def process_search_and_play(input_text, specified_sources="all"):
-    """
-    主处理逻辑 (需求4：优先匹配歌单)
-    """
-    # 1. 尝试匹配歌单 (完全匹配)
-    # 检查是否存在该名称的歌单
+    # 1. 检查是否是歌单
     all_playlists = database.get_all_playlists()
     for pl in all_playlists:
         if pl['name'] == input_text:
             print(f"🎯 命中本地歌单: {input_text}")
-            success, msg = start_playlist_playback(input_text)
-            record_action("语音指令", f"播放歌单: {input_text}", "成功" if success else "失败", msg, 0)
-            return {"success": success, "msg": msg}
+            start_playlist_playback(input_text)
+            return {"success": True, "msg": f"开始播放歌单: {input_text}"}
 
-    # 2. 如果不是歌单，走原来的搜索逻辑
-    system_status["playlist_mode"] = False # 退出歌单模式
-    
+    # 2. 单曲搜索模式
+    system_status["playlist_mode"] = False
     t_start = time.time()
-    current_source = specified_sources if specified_sources else MUSIC_SOURCE
-    print(f"\n====== [开始搜索] {input_text} (源: {current_source}) ======")
-
-    success, msg, song_info, play_url, error_logs = search_and_get_url(input_text, source=current_source)
+    
+    success, msg, song_info, play_url, error_logs = search_and_get_url(input_text, source=specified_sources)
 
     if error_logs:
         for err in error_logs:
@@ -201,58 +216,132 @@ def process_search_and_play(input_text, specified_sources="all"):
         record_action("任务失败", input_text, "全部失败", msg, int((time.time() - t_start) * 1000))
         return {"success": False, "msg": msg}
 
-    # 播放成功
     real_source = song_info.get('source_label', 'unknown')
     total_duration = int((time.time() - t_start) * 1000)
+    
+    # 单曲模式下的日志
+    print(f"🎉 [单曲选中] 源: {real_source}")
+    print(f"🔗 [播放地址] {play_url}")
+
     record_action("获取链接", f"{song_info['name']} (源:{real_source})", "成功", play_url, total_duration)
 
-    ha_success = play_url_on_ha(play_url, song_info['name'])
-
-    if ha_success:
+    if play_url_on_ha(play_url, song_info['name']):
+        # 更新本地状态
+        system_status["current_track_title"] = song_info['name']
+        system_status["current_track_source"] = real_source
+        
         return {"success": True, "msg": f"播放: {song_info['name']}", "data": song_info}
     else:
         return {"success": False, "msg": "HA调用失败"}
 
-# === 后台监控线程 (需求6：自动切歌) ===
+# === 自动切歌监控 (核心修复：状态同步+防误触) ===
 def background_monitor():
     system_status["thread_active"] = True
-    last_text = ""
     
+    # === 启动时忽略旧指令 ===
+    last_text = ""
+    if CONVERSATION_ENTITY_ID:
+        print("🔄 正在初始化状态，同步 HA 现有指令...")
+        initial_state = get_ha_state(CONVERSATION_ENTITY_ID)
+        if initial_state:
+            last_text = initial_state
+            print(f"✅ 状态已同步 (忽略旧指令): {last_text}")
+        else:
+            print("⚠️ 未能获取初始状态或状态为空")
+
     while True:
         system_status["last_heartbeat"] = datetime.now().strftime("%H:%M:%S")
-        
-        # 1. 语音监控
         try:
+            # 1. 语音控制监控
             if CONVERSATION_ENTITY_ID:
                 current_text = get_ha_state(CONVERSATION_ENTITY_ID)
+                # 只有当 current_text 不为空，且真的发生了变化时，才执行
                 if current_text and current_text != last_text and current_text != "unavailable":
                     last_text = current_text
-                    trigger_word = "帮我搜"
-                    if current_text.startswith(trigger_word):
-                        keyword = current_text.replace(trigger_word, "").strip()
-                        # 触发搜索或歌单
+                    if current_text.startswith("帮我搜"):
+                        keyword = current_text.replace("帮我搜", "").strip()
                         process_search_and_play(keyword, "all")
+            
+            # 2. 歌单自动切歌监控
+            if system_status["playlist_mode"]:
+                # 获取播放器真实状态
+                ha_state, ha_attrs = get_ha_player_info()
+                
+                # 关键修复：只有当状态为 'playing' 时才进行计时和切歌判断
+                if ha_state == 'playing':
+                    should_switch = False
+                    
+                    # [优先策略] 使用 HA 返回的媒体进度 (Media Position)
+                    if 'media_position' in ha_attrs and 'media_duration' in ha_attrs:
+                        try:
+                            current_pos = float(ha_attrs['media_position'])
+                            total_dur = float(ha_attrs['media_duration'])
+                            # 如果总时长有效且剩余时间小于 5 秒
+                            if total_dur > 0 and (total_dur - current_pos) <= 5:
+                                print(f"⏰ [进度同步] 歌曲剩余 {total_dur - current_pos:.1f}s，准备切歌...")
+                                should_switch = True
+                        except (ValueError, TypeError):
+                            pass 
+                    
+                    # [降级策略] 本地计时器 (只有在 HA 处于 playing 状态时才累计)
+                    if not should_switch and system_status["playing_start_time"] > 0:
+                        elapsed = time.time() - system_status["playing_start_time"]
+                        duration = system_status["current_duration"]
+                        switch_threshold = duration - 5 if duration > 10 else duration
+                        
+                        if elapsed > switch_threshold:
+                            print(f"⏰ [本地计时] 已播 {elapsed:.1f}s / 总 {duration}s，触发切歌")
+                            should_switch = True
+                    
+                    # 执行切歌
+                    if should_switch:
+                        system_status["current_index"] += 1
+                        system_status["playing_start_time"] = 0 
+                        # 这里的 play_current_queue_song 会处理索引越界并循环
+                        play_current_queue_song()
+                    
         except Exception as e:
-            print(f"Monitor Error: {e}")
-
-        # 2. 歌单自动切歌逻辑 (需求6)
-        if system_status["playlist_mode"] and system_status["playing_start_time"] > 0:
-            elapsed = time.time() - system_status["playing_start_time"]
-            # 缓冲 2 秒，防止刚放完就切
-            if elapsed > (system_status["current_duration"] + 2):
-                print(f"⏰ 单曲时间到 ({int(elapsed)}s)，切下一首")
-                system_status["current_index"] += 1
-                play_current_queue_song()
-
+            print(f"Error in monitor: {e}")
+        
         time.sleep(2)
 
-# ================= 路由 =================
+# === 路由 ===
 @app.route('/')
 def index(): return render_template('dashboard.html')
 
 @app.route('/api/stats')
 def get_stats():
     db_stats = database.get_source_stats()
+    
+    # 1. 获取 HA 真实状态
+    ha_state, ha_attrs = get_ha_player_info()
+    
+    # 2. 决定显示什么
+    display_status = "待机 / 准备就绪"
+    is_playing_anim = False
+    
+    # 使用本地记录的歌名
+    local_song_name = system_status.get("current_track_title", "未知曲目")
+    display_text = local_song_name
+
+    # 截断太长的歌名
+    if len(display_text) > 22: display_text = display_text[:20] + "..."
+    
+    # 状态判断逻辑
+    if ha_state == 'playing':
+        display_status = f"🎵 正在播放: {display_text}"
+        is_playing_anim = True
+        
+        if system_status["playlist_mode"]:
+             display_status = f"💿 {system_status['current_playlist_name']}: {display_text}"
+
+    elif ha_state == 'paused':
+        display_status = f"⏸️ 已暂停: {display_text}"
+        
+    elif ha_state == 'idle' or ha_state == 'off':
+        if system_status["playlist_mode"]:
+             display_status = "💿 歌单准备中..."
+
     return jsonify({
         "thread_active": system_status["thread_active"],
         "last_heartbeat": system_status["last_heartbeat"],
@@ -260,118 +349,82 @@ def get_stats():
         "playlist_mode": system_status["playlist_mode"],
         "current_playlist": system_status["current_playlist_name"] if system_status["playlist_mode"] else None,
         "success_count": db_stats['total'],
-        "source_details": db_stats['details']
+        "source_details": db_stats['details'],
+        "smart_status": display_status,
+        "is_playing": is_playing_anim
     })
 
 @app.route('/api/logs')
-def get_logs(): 
-    # database.fetch_logs 已经过滤了媒体控制按钮的日志
-    return jsonify(database.fetch_logs(limit=30))
+def get_logs(): return jsonify(database.fetch_logs(limit=30))
 
 @app.route('/api/manual_exec', methods=['POST'])
 def manual_exec():
-    req_data = request.json
-    # 1. 历史重播 / 手动指定URL
-    if 'url' in req_data and req_data['url']:
-        play_url = req_data['url']
-        song_name = req_data.get('song_name', '未知歌曲')
-        ha_success = play_url_on_ha(play_url, song_name)
-        if ha_success:
-            # 手动点播打断歌单模式
-            system_status["playlist_mode"] = False
-            record_action("历史重播", f"{song_name}", "成功", play_url, 0)
-            return jsonify({"success": True, "msg": f"正在重播: {song_name}"})
-        return jsonify({"success": False, "msg": "HA调用失败"})
-
-    # 2. 搜索 / 播放歌单
-    song_name = req_data.get('song_name')
-    sources = req_data.get('sources', 'all')
-    if not song_name: return jsonify({"success": False})
+    req = request.json
+    if 'url' in req and req['url']:
+        song_name = req.get('song_name', '未知/重播')
+        system_status["playlist_mode"] = False
+        
+        if play_url_on_ha(req['url'], song_name):
+            system_status["current_track_title"] = song_name
+            system_status["current_track_source"] = "Manual"
+            return jsonify({"success": True, "msg": "推送成功"})
+        return jsonify({"success": False, "msg": "HA失败"})
     
-    return jsonify(process_search_and_play(song_name, sources))
+    return jsonify(process_search_and_play(req.get('song_name'), req.get('sources', 'all')))
 
 @app.route('/api/clear_logs', methods=['POST'])
 def clear_logs(): return jsonify({"success": database.clear_all_logs()})
 
-# === 媒体控制 (需求1 & 2：日志已在 database.py 过滤) ===
 @app.route('/api/control/<action>', methods=['POST'])
 def media_control(action):
-    # (需求1) 前端只留了特定按钮，但后端API兼容
-    service = ""
-    data = {"entity_id": PLAYER_ENTITY_ID}
+    if action == "next" and system_status["playlist_mode"]:
+        system_status["current_index"] += 1
+        # 这里的 play_current_queue_song 也会处理手动点击下一首时的循环
+        play_current_queue_song()
+        return jsonify({"success": True, "msg": "下一首"})
     
-    if action == "play_pause":
-        service = "media_play_pause"
-    elif action == "next":
-        # 如果在歌单模式，手动下一首
-        if system_status["playlist_mode"]:
-            system_status["current_index"] += 1
-            play_current_queue_song()
-            return jsonify({"success": True, "msg": "歌单下一首"})
-        service = "media_next_track"
-    elif action == "previous":
-         # 如果在歌单模式，手动上一首
-        if system_status["playlist_mode"]:
-            system_status["current_index"] = max(0, system_status["current_index"] - 1)
-            play_current_queue_song()
-            return jsonify({"success": True, "msg": "歌单上一首"})
-        service = "media_previous_track"
-    else:
-        return jsonify({"success": False, "msg": "不支持的指令"})
+    if action == "previous" and system_status["playlist_mode"]:
+        # 上一首如果已经是第一首，可以循环到最后一首，或者停在第一首，这里保持原样（停在第一首）
+        # 如果需要循环到最后一首，修改为:
+        # system_status["current_index"] = system_status["current_index"] - 1
+        # if system_status["current_index"] < 0: system_status["current_index"] = len(system_status["queue"]) - 1
+        system_status["current_index"] = max(0, system_status["current_index"] - 1)
+        play_current_queue_song()
+        return jsonify({"success": True, "msg": "上一首"})
 
-    success = call_ha_service("media_player", service, data)
-    if success:
-        # 记录日志，但在前端会被过滤不显示 (需求2)
-        record_action("媒体控制", f"执行: {action}", "成功", "", 0)
-        return jsonify({"success": True, "msg": "OK"})
-    return jsonify({"success": False, "msg": "Fail"})
+    service_map = {
+        "play_pause": "media_play_pause",
+        "next": "media_next_track",
+        "previous": "media_previous_track"
+    }
+    if action in service_map:
+        if call_ha_service("media_player", service_map[action], {"entity_id": PLAYER_ENTITY_ID}):
+            return jsonify({"success": True, "msg": "OK"})
+    
+    return jsonify({"success": False, "msg": "失败"})
 
-# === 歌单管理 API (需求3) ===
+# 歌单 API 路由
 @app.route('/api/playlists', methods=['GET'])
-def list_playlists():
-    return jsonify(database.get_all_playlists())
-
+def list_pl(): return jsonify(database.get_all_playlists())
 @app.route('/api/playlists', methods=['POST'])
-def create_playlist():
-    name = request.json.get('name')
-    if not name: return jsonify({"success": False, "msg": "名称为空"})
-    success, msg = database.create_playlist(name)
-    return jsonify({"success": success, "msg": msg})
-
+def create_pl(): return jsonify({"success": database.create_playlist(request.json.get('name'))[0]})
 @app.route('/api/playlists/<name>', methods=['DELETE'])
-def delete_playlist(name):
-    success, msg = database.delete_playlist(name)
-    return jsonify({"success": success, "msg": msg})
-
+def del_pl(name): return jsonify({"success": database.delete_playlist(name)[0]})
 @app.route('/api/playlists/<name>/rename', methods=['POST'])
-def rename_playlist(name):
-    new_name = request.json.get('new_name')
-    success, msg = database.rename_playlist(name, new_name)
-    return jsonify({"success": success, "msg": msg})
-
+def rename_pl(name): return jsonify({"success": database.rename_playlist(name, request.json.get('new_name'))[0]})
 @app.route('/api/playlists/<name>/songs', methods=['GET'])
-def get_playlist_songs(name):
-    return jsonify(database.get_playlist_songs(name))
-
+def get_songs(name): return jsonify(database.get_playlist_songs(name))
 @app.route('/api/playlists/<name>/songs', methods=['POST'])
-def add_song_to_playlist_route(name):
-    data = request.json
-    song_name = data.get('name')
-    url = data.get('url')
-    success, msg = database.add_song_to_playlist(name, song_name, url)
-    return jsonify({"success": success, "msg": msg})
-
-@app.route('/api/songs/<int:song_id>', methods=['DELETE'])
-def delete_song(song_id):
-    success, msg = database.remove_song_from_playlist(song_id)
-    return jsonify({"success": success, "msg": msg})
+def add_song(name): return jsonify({"success": database.add_song_to_playlist(name, request.json.get('name'), "")[0]})
+@app.route('/api/songs/<int:id>', methods=['DELETE'])
+def del_song(id): return jsonify({"success": database.remove_song_from_playlist(id)[0]})
+@app.route('/api/songs/<int:id>/rename', methods=['POST'])
+def rename_song(id):
+    return jsonify({"success": database.rename_song_in_playlist(id, request.json.get('new_name'))[0]})
 
 if __name__ == "__main__":
-    try:
-        database.init_db()
-    except:
-        pass
-    monitor = threading.Thread(target=background_monitor, daemon=True)
-    monitor.start()
-    print(f"🚀 音乐服务器启动 | 模式: {MUSIC_SOURCE}")
+    try: database.init_db()
+    except: pass
+    threading.Thread(target=background_monitor, daemon=True).start()
+    print(f"🚀 音乐服务器启动 | 源: {MUSIC_SOURCE}")
     app.run(host='0.0.0.0', port=5000, debug=False)

@@ -2,7 +2,6 @@ import sqlite3
 import os
 import sys
 import re
-import logging
 from datetime import datetime
 
 # === 核心配置 ===
@@ -22,7 +21,7 @@ def check_and_fix_schema(conn):
     """
     c = conn.cursor()
     
-    # --- 1. 定义所有需要的表结构 ---
+    # --- 定义表结构 ---
     tables = {
         "api_logs": '''CREATE TABLE IF NOT EXISTS api_logs (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,74 +47,52 @@ def check_and_fix_schema(conn):
                         )'''
     }
 
-    # --- 2. 创建或修复表 ---
+    # --- 创建或修复 ---
     for table_name, create_sql in tables.items():
         try:
-            # 尝试创建表（如果不存在）
             c.execute(create_sql)
-            
-            # --- 3. 字段补全 (简单的 Migration 逻辑) ---
-            # 获取当前表的所有字段
+            # 检查字段是否存在，不存在则添加
             c.execute(f"PRAGMA table_info({table_name})")
             existing_columns = [row['name'] for row in c.fetchall()]
             
-            # 针对 api_logs 表检查 duration_ms (防止旧版数据库报错)
             if table_name == "api_logs" and "duration_ms" not in existing_columns:
-                print(f"🔧 正在修复表 {table_name}: 添加 duration_ms 字段")
                 c.execute("ALTER TABLE api_logs ADD COLUMN duration_ms INTEGER DEFAULT 0")
-                
-            # 针对 playlist_songs 表的检查 (示例)
+            
             if table_name == "playlist_songs" and "url" not in existing_columns:
-                print(f"🔧 正在修复表 {table_name}: 添加 url 字段")
                 c.execute("ALTER TABLE playlist_songs ADD COLUMN url TEXT")
                 
         except Exception as e:
-            print(f"⚠️ 初始化表 {table_name} 时遇到非致命错误: {e}")
+            print(f"⚠️ 表 {table_name} 检查警告: {e}")
 
     conn.commit()
 
 def init_db():
-    """初始化入口"""
     try:
         conn = get_db_connection()
         check_and_fix_schema(conn)
         conn.close()
-        # print("✅ 数据库结构检查完毕") # 减少日志干扰，注释掉
     except Exception as e:
-        print(f"❌ 数据库初始化严重失败: {e}")
+        print(f"❌ 数据库初始化失败: {e}")
 
 # === 装饰器：自动修复与重试 ===
-# 这是实现“不需要删除源文件”的核心
 def safe_db_execute(func):
-    """
-    装饰器：当数据库操作遇到 'no such table' 错误时，
-    自动执行 init_db() 进行修复，然后重试一次。
-    """
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
         except sqlite3.OperationalError as e:
-            error_msg = str(e).lower()
-            # 捕获表缺失或列缺失错误
-            if "no such table" in error_msg or "no such column" in error_msg:
-                print(f"⚠️ 检测到数据库结构缺失 ({e})，正在尝试自动修复...")
-                init_db() # 执行修复
+            if "no such table" in str(e) or "no such column" in str(e):
+                print(f"⚠️ 数据库结构异常 ({e})，正在自动修复...")
+                init_db()
                 try:
-                    print("🔄 修复完成，正在重试操作...")
-                    return func(*args, **kwargs) # 重试
-                except Exception as retry_e:
-                    print(f"❌ 自动修复后重试依然失败: {retry_e}")
-                    return False # 或者根据原函数返回空列表等
-            else:
-                print(f"❌ 数据库操作未知错误: {e}")
-                raise e # 其他错误直接抛出
-        except Exception as e:
-            print(f"❌ 系统错误: {e}")
-            return False # 通用失败返回
+                    return func(*args, **kwargs)
+                except Exception:
+                    return False
+            return False
+        except Exception:
+            return False
     return wrapper
 
-# === 日志相关功能 ===
-
+# === 日志功能 ===
 @safe_db_execute
 def insert_log(action_type, detail, status, api_response="", duration_ms=0):
     conn = get_db_connection()
@@ -137,10 +114,8 @@ def insert_log(action_type, detail, status, api_response="", duration_ms=0):
 def fetch_logs(limit=30):
     conn = get_db_connection()
     c = conn.cursor()
-    # 过滤掉 '媒体控制' 类型的日志
-    c.execute(
-        "SELECT * FROM api_logs WHERE action_type != '媒体控制' ORDER BY id DESC LIMIT ?",
-        (limit,))
+    # 过滤媒体控制日志
+    c.execute("SELECT * FROM api_logs WHERE action_type != '媒体控制' ORDER BY id DESC LIMIT ?", (limit,))
     rows = c.fetchall()
     conn.close()
 
@@ -152,7 +127,7 @@ def fetch_logs(limit=30):
             "type": row['action_type'],
             "detail": row['detail'],
             "status": row['status'],
-            "duration": row['duration_ms'] if 'duration_ms' in row.keys() else 0, # 兼容旧数据
+            "duration": row['duration_ms'] if 'duration_ms' in row.keys() else 0,
             "response": row['api_response']
         })
     return data
@@ -167,9 +142,15 @@ def clear_all_logs():
 
 @safe_db_execute
 def get_source_stats():
+    """
+    统计各源的成功播放次数
+    """
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT detail FROM api_logs WHERE action_type='获取链接' AND status='成功'")
+    
+    # 查找所有成功的播放记录，无论是单曲搜索("获取链接")还是歌单自动播放("歌单播放")
+    c.execute("SELECT detail FROM api_logs WHERE (action_type='获取链接' OR action_type='歌单播放') AND status='成功'")
+    
     rows = c.fetchall()
     conn.close()
 
@@ -177,6 +158,7 @@ def get_source_stats():
     total = 0
     for row in rows:
         total += 1
+        # 提取 "歌名 (源:qqmp3)" 中的源名称
         match = re.search(r'\(源:(.*?)\)', row['detail'])
         if match:
             source_name = match.group(1)
@@ -185,8 +167,7 @@ def get_source_stats():
             stats['unknown'] = stats.get('unknown', 0) + 1
     return {"total": total, "details": stats}
 
-# === 歌单管理功能 (全部加上 safe_db_execute) ===
-
+# === 歌单管理 ===
 @safe_db_execute
 def create_playlist(name):
     try:
@@ -226,7 +207,7 @@ def delete_playlist(name):
     return False, "歌单不存在"
 
 @safe_db_execute
-def add_song_to_playlist(playlist_name, song_name, url):
+def add_song_to_playlist(playlist_name, song_name, url=""):
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT id FROM playlists WHERE name=?", (playlist_name,))
@@ -237,6 +218,7 @@ def add_song_to_playlist(playlist_name, song_name, url):
     
     pid = res['id']
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # url 允许为空
     c.execute("INSERT INTO playlist_songs (playlist_id, name, url, added_at) VALUES (?, ?, ?, ?)", 
               (pid, song_name, url, ts))
     conn.commit()
@@ -253,21 +235,28 @@ def remove_song_from_playlist(song_id):
     return True, "移除成功"
 
 @safe_db_execute
+def rename_song_in_playlist(song_id, new_name):
+    """重命名歌单中的歌曲"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("UPDATE playlist_songs SET name = ? WHERE id = ?", (new_name, song_id))
+    conn.commit()
+    conn.close()
+    return True, "重命名成功"
+
+@safe_db_execute
 def get_all_playlists():
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT * FROM playlists ORDER BY created_at DESC")
-    playlists = []
     rows = c.fetchall()
     
-    # 这里需要单独处理，因为在循环里不能共用cursor，建议分步查询
+    playlists = []
     for row in rows:
         # 获取歌曲数量
-        # 这里创建一个新的临时连接或者 cursor 比较安全，但为了简单，直接 execute
-        # 注意：sqlite fetchall 后 cursor 可以复用
         c.execute("SELECT COUNT(*) as count FROM playlist_songs WHERE playlist_id=?", (row['id'],))
-        count_res = c.fetchone()
-        count = count_res['count'] if count_res else 0
+        res = c.fetchone()
+        count = res['count'] if res else 0
         playlists.append({"id": row['id'], "name": row['name'], "count": count})
     
     conn.close()
@@ -290,5 +279,5 @@ def get_playlist_songs(playlist_name):
     conn.close()
     return songs
 
-# 程序启动时强制检查一次
+# 启动自检
 init_db()
